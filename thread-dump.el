@@ -13,6 +13,7 @@
     (define-key map (kbd "p") 'thread-dump-overview-show-prev-thread)
     (define-key map (kbd "k") 'thread-dump-overview-show-prev-thread)
     (define-key map (kbd "RET") 'thread-dump-overview-show-thread)
+    (define-key map (kbd "<mouse-1>") 'thread-dump-overview-show-thread)
     (define-key map (kbd "o") 'thread-dump-overview-show-thread)
     (define-key map (kbd "v") 'thread-dump-overview-visit-thread)
     (define-key map (kbd "h") 'thread-dump-overview-hide)
@@ -64,19 +65,23 @@
 (defun thread-dump-show-overview (threads)
   (let* ((buf (thread-dump-get-overview-buffer)))
     (set-buffer buf)
-    (let ((inhibit-read-only t))
-      (setq thread-dump-threads threads)
-      (erase-buffer)
-      (dolist (thread threads nil)
-        (unless (or (thread-dump-hidden-thread? thread)
-                    (thread-dump-filtered-thread? thread))
-          (thread-dump-show-thread-header thread)))
-      (backward-delete-char 1))
-    (goto-char (point-min))
-    (switch-to-buffer buf)
-    (setq buffer-read-only t)
-    (goto-line 1)
-    (thread-dump-overview-visit-thread)))
+    (let ((thread (thread-dump-get-thread-at-point)))
+      (let ((inhibit-read-only t))
+        (setq thread-dump-threads threads)
+        (erase-buffer)
+        (dolist (thread threads nil)
+          (unless (or (thread-dump-get-thread-hidden thread)
+                      (thread-dump-filtered-thread? thread))
+            (thread-dump-show-thread-header thread)))
+        (backward-delete-char 1))
+      (goto-char (point-min))
+      (switch-to-buffer buf)
+      (setq buffer-read-only t)
+      (goto-line
+       (or (thread-dump-find-thread-line thread) ; stay on same thread if possible
+           thread-dump-ow-cur-thread-line)) ; otherwise, go to same line
+      (thread-dump-overview-visit-thread)
+      (pop-to-buffer buf))))
 
 (defun thread-dump-get-overview-buffer ()
   (let ((existing (get-buffer "*thread-dump-overview*")))
@@ -84,7 +89,6 @@
         (let ((new (get-buffer-create "*thread-dump-overview*")))
           (with-current-buffer new
             (make-variable-buffer-local 'thread-dump-ow-cur-thread-line)
-            (make-variable-buffer-local 'thread-dump-hidden-threads)
             (make-variable-buffer-local 'thread-dump-filter)
             (make-variable-buffer-local 'thread-dump-threads)
             (make-variable-buffer-local 'thread-dump-file)
@@ -93,7 +97,6 @@
             (make-variable-buffer-local 'truncate-lines)
 
             (setq thread-dump-ow-cur-thread-line nil)
-            (setq thread-dump-hidden-threads nil)
             (setq thread-dump-filter nil)
             (setq thread-dump-threads nil)
             (setq thread-dump-file nil)
@@ -103,64 +106,112 @@
             new)
           ))))
 
-(defun thread-dump-hidden-thread? (thread)
-  (when thread-dump-hidden-threads
-    (let ((s (thread-dump-get-thread-stack thread))
-          (name (thread-dump-get-thread-name thread)))
-      (delq nil
-            (mapcar (lambda (hidden-thread)
-                      (if (eq (thread-dump-get-hidden-thread-selection hidden-thread) 'same)
-                          (and (string= (thread-dump-get-hidden-thread-stack hidden-thread) s)
-                               (string= (thread-dump-get-hidden-thread-name hidden-thread) name))
-                        (string= (thread-dump-get-hidden-thread-stack hidden-thread) s)))
-                    thread-dump-hidden-threads)))))
+(defun thread-dump-scrub-stack (stack)
+  (and stack (replace-regexp-in-string "<[^>]+>" "<>" stack)))
 
 (defun thread-dump-filtered-thread? (thread)
   (when thread-dump-filter
     (not (thread-dump-match thread-dump-filter thread))))
 
-(defun thread-dump-overview-hide ()
-  (interactive)
-  (setq thread-dump-hidden-threads
-          (cons
-           (list
-            (cons 'thread (thread-dump-get-thread-at-point))
-            (cons 'selection 'same))
-           thread-dump-hidden-threads))
-  (let ((line (line-number-at-pos)))
-    (thread-dump-show-overview thread-dump-threads)))
+(defun thread-dump-overview-hide (&optional arg)
+  (interactive "P")
+  (if arg
+      ;; unhide all threads
+      (mapc (lambda (thread) (thread-dump-set-thread-hidden thread nil))
+            thread-dump-threads)
+    (thread-dump-set-thread-hidden (thread-dump-get-thread-at-point) t))
+  (thread-dump-show-overview thread-dump-threads))
 
 (defun thread-dump-overview-hide-with-same-stack (&optional arg)
   (interactive "P")
   (if arg
-      (setq thread-dump-hidden-threads nil)
-    (setq thread-dump-hidden-threads
-          (cons
-           (list
-            (cons 'thread (thread-dump-get-thread-at-point))
-            (cons 'selection 'with-same-stack))
-           thread-dump-hidden-threads)))
-  (let ((line (line-number-at-pos)))
-    (thread-dump-show-overview thread-dump-threads)))
+      ;; unhide all threads
+      (mapc (lambda (thread) (thread-dump-set-thread-hidden thread nil))
+            thread-dump-threads)
+    ;; hide matching threads
+    (let ((stack (thread-dump-get-thread-stack-scrubbed (thread-dump-get-thread-at-point))))
+      (mapc
+       (lambda (thread)
+         (when (string= stack (thread-dump-get-thread-stack-scrubbed thread))
+           (thread-dump-set-thread-hidden thread t)))
+       thread-dump-threads)))
+  (thread-dump-show-overview thread-dump-threads))
 
 (defun thread-dump-overview-quit ()
   (interactive)
   (delete-other-windows)
   (bury-buffer))
 
+(defun thread-dump-get-thread-face (thread)
+  `(:foreground ,(hexrgb-hsv-to-hex (/ (float (random (thread-dump-get-thread-stack-scrubbed thread))) most-positive-fixnum) 1 1)))
+
+(defun thread-dump-get-thread-state-face (thread-state)
+  `(:foreground
+    ,(cond
+      ((string= thread-state "BLOCKED") "red")
+      ((string= thread-state "RUNNABLE") "green")
+      ((string= thread-state "WAITING") "blue")
+      ((string= thread-state "TIMED_WAITING") "yellow")
+      ((string= thread-state "TERMINATED") "gray")
+      ((string= thread-state "NEW") "white")
+      (t nil))))
+
 (defun thread-dump-show-thread-header (thread)
-  (insert (propertize (concat (thread-dump-get-thread-name thread) "\n")
-                      'id (thread-dump-get-thread-id thread))))
+  (insert (propertize
+           (concat
+            (propertize (thread-dump-get-thread-name thread)
+                        'face (thread-dump-get-thread-face thread))
+            
+            "\t"
+            (let ((state (thread-dump-get-thread-state thread)))
+              (when state
+                (propertize state
+                            'face (thread-dump-get-thread-state-face state))))
+            (let ((waiting-to-lock (thread-dump-get-thread-waiting-to-lock thread)))
+              (when waiting-to-lock
+                (concat "  on " (thread-dump-link-lock waiting-to-lock))))
+            (let ((locks-held (thread-dump-get-thread-locks-held thread)))
+              (when locks-held
+                (concat " holds " (mapconcat 'thread-dump-pretty-lock locks-held ","))))"\n")
+           'id (thread-dump-get-thread-id thread))))
+
+(defun thread-dump-link-lock (lock)
+  (lexical-let ((lock lock))
+    (propertize
+     (thread-dump-pretty-lock lock)
+     'action
+     (lambda (x)
+       (let ((thread (thread-dump-find-thread-holding-lock lock)))
+         (if thread
+             (thread-dump-goto-thread thread)
+           (message "Can't find thread holding lock"))))
+     'button '(t)
+     'category 'default-button
+     'follow-link "\C-m"
+     )))
+
+(defun thread-dump-pretty-lock (lock)
+  (let ((thread (thread-dump-find-thread-holding-lock lock)))
+    (propertize (replace-regexp-in-string "0x0*" "" lock)
+                'face (and thread (thread-dump-get-thread-face thread)))))
+
+(defun thread-dump-goto-thread (thread)
+  (let ((line (thread-dump-find-thread-line thread)))
+    (if line
+        (progn
+          (goto-line line)
+          (thread-dump-overview-visit-thread))
+      (message "Thread is hidden"))))
 
 (defun thread-dump-overview-next-thread ()
   (interactive)
   (unless (eq (point-max) (line-end-position))
-    (next-line)))
+    (forward-line)))
 
 (defun thread-dump-overview-prev-thread ()
   (interactive)
   (unless (eq (point-min) (line-beginning-position))
-    (next-line -1)))
+    (forward-line -1)))
 
 (defun thread-dump-overview-show-next-thread ()
   (interactive)
@@ -187,7 +238,7 @@
     (set-buffer buf)
     (erase-buffer)
     (set (make-local-variable 'truncate-lines) t)
-    (insert (thread-dump-get-thread-contents thread))
+    (insert (if thread (thread-dump-get-thread-contents thread) "No thread selected"))
     (goto-char (point-min))
     (when filter
       (while (search-forward filter nil 't)
@@ -208,16 +259,24 @@
 
 (defun thread-dump-get-thread-at-point ()
   (let ((id (get-text-property (point) 'id)))
-    (thread-dump-find-thread-by-id id)))
+    (and id (thread-dump-find-thread-by-id id))))
 
-(defun thread-dump-highlight-cur-thread ()
+(defun thread-dump-find-thread-line (thread)
+  (save-excursion
+    (beginning-of-buffer)
+    (loop
+     if (eq thread (thread-dump-get-thread-at-point)) return (line-number-at-pos (point))
+     while (= 0 (forward-line))
+     finally return nil)))
+
+(defun thread-dump-highlight-thread ()
   (let ((inhibit-read-only t))
     (when thread-dump-ow-cur-thread-line
       (save-excursion
         (goto-line thread-dump-ow-cur-thread-line)
-        (put-text-property (point-at-bol) (point-at-eol) 'face 'default)))
+        (add-face-text-property (point-at-bol) (point-at-eol) '(:underline nil :weight normal))))
     (setq thread-dump-ow-cur-thread-line (line-number-at-pos))
-    (put-text-property (point-at-bol) (point-at-eol) 'face 'thread-dump-current-thread)))
+    (add-face-text-property (point-at-bol) (point-at-eol) '(:underline t :weight bold))))
 
 (defun thread-dump-overview-open-next-dump ()
   (interactive)
@@ -240,6 +299,11 @@
   (find id
         thread-dump-threads
         :test '(lambda (x y) (= x (cdr (assoc 'id y))))))
+
+(defun thread-dump-find-thread-holding-lock (lock)
+  (find lock
+        thread-dump-threads
+        :test '(lambda (lock thread) (member lock (cdr (assoc 'locks-held thread))))))
 
 (defun thread-dump-overview-filter (term)
   (interactive "MFilter: ")
@@ -271,7 +335,12 @@
          (name-end (or (- (search-forward "\"" (line-end-position) t) 1) (line-end-position)))
          (state (thread-dump-parse-thread-state-at-point))
          (stack-start (thread-dump-get-stack-start-at-point))
-         (thread-end (if (re-search-forward "^\n" nil t) (line-beginning-position 1) (point-max))))
+         (thread-end (if (re-search-forward "^\n" nil t) (line-beginning-position 1) (point-max)))
+         (waiting-to-lock (thread-dump-parse-waiting-to-lock-in-range thread-start thread-end))
+         (waiting-on (thread-dump-parse-waiting-on-in-range thread-start thread-end))
+         ;; anything we are waiting on is not a held lock, so take it out of locs-held.
+         (locks-held (remove waiting-on (thread-dump-parse-locks-held-in-range thread-start thread-end))))
+    (goto-char thread-end)
     (list
        (cons 'id thread-id)
        (cons 'name (buffer-substring-no-properties name-start name-end))
@@ -279,7 +348,28 @@
        (cons 'end thread-end)
        (cons 'contents (buffer-substring-no-properties thread-start thread-end))
        (cons 'state state)
-       (cons 'stack (if stack-start (buffer-substring-no-properties stack-start thread-end) nil)))))
+       (cons 'stack (if stack-start (buffer-substring-no-properties stack-start thread-end) nil))
+       (cons 'waiting-to-lock waiting-to-lock)
+       (cons 'locks-held locks-held)
+       (cons 'hidden nil))))
+
+(defun thread-dump-parse-locks-held-in-range (start end)
+  (goto-char start)
+  (let (locks-held)
+    (while (re-search-forward "- locked <\\([^>]+\\)>" end t)
+      (push (buffer-substring-no-properties (match-beginning 1) (match-end 1))
+            locks-held))
+    locks-held))
+
+(defun thread-dump-parse-waiting-to-lock-in-range (start end)
+  (goto-char start)
+  (if (re-search-forward "- waiting to lock <\\([^>]+\\)>" end t)
+      (buffer-substring-no-properties (match-beginning 1) (match-end 1))))
+
+(defun thread-dump-parse-waiting-on-in-range (start end)
+  (goto-char start)
+  (if (re-search-forward "- waiting on <\\([^>]+\\)>" end t)
+      (buffer-substring-no-properties (match-beginning 1) (match-end 1))))
 
 (defun thread-dump-parse-thread-state-at-point ()
   (if (re-search-forward "java.lang.Thread.State: \\b\\([a-zA-Z_]+\\)\\b" (line-end-position 2) t)
@@ -303,17 +393,25 @@
 (defun thread-dump-get-thread-state (thread)
   (cdr (assoc 'state thread)))
 
+(defun thread-dump-get-thread-waiting-to-lock (thread)
+  (cdr (assoc 'waiting-to-lock thread)))
+
+(defun thread-dump-get-thread-locks-held (thread)
+  (cdr (assoc 'locks-held thread)))
+
 (defun thread-dump-get-thread-stack (thread)
   (cdr (assoc 'stack thread)))
 
-(defun thread-dump-get-hidden-thread-stack (thread)
-  (thread-dump-get-thread-stack (cdr (assoc 'thread thread))))
+(defun thread-dump-get-thread-stack-scrubbed (thread)
+  (thread-dump-scrub-stack (cdr (assoc 'stack thread))))
 
-(defun thread-dump-get-hidden-thread-selection (thread)
-  (cdr (assoc 'selection thread)))
+(defun thread-dump-get-thread-hidden (thread)
+  (cdr (assoc 'hidden thread)))
 
-(defun thread-dump-get-hidden-thread-name (thread)
-  (thread-dump-get-thread-name (cdr (assoc 'thread thread))))
+(defun thread-dump-set-thread-hidden (thread hidden)
+  (setf (cdr (assoc 'hidden thread)) hidden))
+
+
 
 (defface thread-dump-current-thread
   '((t :underline t
