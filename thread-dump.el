@@ -229,7 +229,7 @@
 
 (defun thread-dump-overview-visit-thread (&optional switch-to-details)
   (interactive)
-  (thread-dump-highlight-cur-thread)
+  (thread-dump-highlight-thread)
   (let* ((thread (thread-dump-get-thread-at-point))
          (file thread-dump-file)
          (buf (get-buffer-create "*thread-dump-details*"))
@@ -241,7 +241,7 @@
     (insert (if thread (thread-dump-get-thread-contents thread) "No thread selected"))
     (goto-char (point-min))
     (when filter
-      (while (search-forward filter nil 't)
+      (while (re-search-forward filter nil t)
         (put-text-property (match-beginning 0) (match-end 0) 'face 'highlight)))
     (and file (setq header-line-format (list file)))
 
@@ -368,7 +368,7 @@
 
 (defun thread-dump-parse-waiting-on-in-range (start end)
   (goto-char start)
-  (if (re-search-forward "- waiting on <\\([^>]+\\)>" end t)
+  (if (re-search-forward "- \\(?:waiting on \\|parking to wait for *\\)<\\([^>]+\\)>" end t)
       (buffer-substring-no-properties (match-beginning 1) (match-end 1))))
 
 (defun thread-dump-parse-thread-state-at-point ()
