@@ -24,6 +24,16 @@
     (define-key map (kbd "P") 'thread-dump-overview-open-prev-dump)
     map))
 
+(defconst thread-dump-details-mode-map
+  (let ((map (make-keymap)))
+    (define-key map (kbd "q") 'delete-window)
+    map))
+
+(defun thread-dump-mode ()
+  "Open current file as a thread dump."
+  (interactive)
+  (thread-dump-open-file (buffer-file-name)))
+
 (defun thread-dump-overview-mode ()
   (buffer-disable-undo)
   (setq major-mode 'thread-dump-overview-mode
@@ -165,8 +175,8 @@
             "\t"
             (let ((state (thread-dump-get-thread-state thread)))
               (when state
-                (propertize state
-                            'face (thread-dump-get-thread-state-face state))))
+                (format "%-13s" (propertize state
+                             'face (thread-dump-get-thread-state-face state)))))
             (let ((waiting-to-lock (thread-dump-get-thread-waiting-to-lock thread)))
               (when waiting-to-lock
                 (concat "  on " (thread-dump-link-lock waiting-to-lock))))
@@ -225,7 +235,7 @@
 
 (defun thread-dump-overview-show-thread ()
   (interactive)
-  (thread-dump-overview-visit-thread t))
+  (thread-dump-overview-visit-thread nil))
 
 (defun thread-dump-overview-visit-thread (&optional switch-to-details)
   (interactive)
@@ -240,6 +250,9 @@
     (set (make-local-variable 'truncate-lines) t)
     (insert (if thread (thread-dump-get-thread-contents thread) "No thread selected"))
     (goto-char (point-min))
+    (read-only-mode t)
+    (use-local-map thread-dump-details-mode-map)
+    
     (when filter
       (while (re-search-forward filter nil t)
         (put-text-property (match-beginning 0) (match-end 0) 'face 'highlight)))
@@ -325,7 +338,7 @@
                 (cons (thread-dump-parse-thread-at-point thread-id) threads))
           (setq thread-id (+ thread-id 1)))
 
-        (sort threads '(lambda (t1 t2)
+        (sort threads #'(lambda (t1 t2)
                          (string< (downcase (thread-dump-get-thread-name t1))
                                   (downcase (thread-dump-get-thread-name t2)))))))))
 
@@ -351,6 +364,7 @@
        (cons 'stack (if stack-start (buffer-substring-no-properties stack-start thread-end) nil))
        (cons 'waiting-to-lock waiting-to-lock)
        (cons 'locks-held locks-held)
+       (cons 'waiting-on waiting-on)
        (cons 'hidden nil))))
 
 (defun thread-dump-parse-locks-held-in-range (start end)
@@ -395,6 +409,9 @@
 
 (defun thread-dump-get-thread-waiting-to-lock (thread)
   (cdr (assoc 'waiting-to-lock thread)))
+
+(defun thread-dump-get-thread-waiting-on (thread)
+  (cdr (assoc 'waiting-on thread)))
 
 (defun thread-dump-get-thread-locks-held (thread)
   (cdr (assoc 'locks-held thread)))
